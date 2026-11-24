@@ -4,10 +4,19 @@
 
 A tiny macOS menu-bar app that shows your **Claude Code** and **Codex** subscription limits as progress bars.
 
-```
-C ▬▬▬▭▭ 42%      green  = 5-hour window
-X ▬▭▭▭▭  7%      purple = weekly window
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/menubar-dark.png">
+    <img src="docs/menubar-light.png" height="44" alt="Menu bar: two bars per tool, green for the 5-hour window and purple for the weekly window">
+  </picture>
+  &nbsp;&nbsp;&nbsp;
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/dropdown-dark.png">
+    <img src="docs/dropdown-light.png" width="320" alt="Dropdown with the percentage and reset time of each window">
+  </picture>
+</p>
+
+Green is the 5-hour window, purple the weekly one (red from 90 %).
 
 - Two bars per tool in the menu bar (5h + week). The number is the 5h percentage.
 - Click it for a detail list: percentage and time until reset for each window.
@@ -73,6 +82,7 @@ One file, no dependencies: [`Tokenly/main.swift`](Tokenly/main.swift).
 bash Tokenly/build.sh                          # builds Tokenly.app here
 Tokenly.app/Contents/MacOS/Tokenly --selftest  # parser/alert/auto-start logic checks
 Tokenly.app/Contents/MacOS/Tokenly --print     # print what the menu would show
+Tokenly.app/Contents/MacOS/Tokenly --screenshots docs  # re-render the README images (sample data)
 ```
 
 The icon is drawn by [`Tokenly/icon/make-icon.swift`](Tokenly/icon/make-icon.swift).

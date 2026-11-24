@@ -558,6 +558,59 @@ final class App: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelega
 }
 
 if CommandLine.arguments.contains("--selftest") { selftest() }
+/// Docs only: view with a rounded background, used to compose the README images.
+final class Backdrop: NSView {
+    let fill: NSColor, radius: CGFloat
+    init(_ frame: NSRect, fill: NSColor, radius: CGFloat = 0) { self.fill = fill; self.radius = radius; super.init(frame: frame) }
+    required init?(coder: NSCoder) { fatalError() }
+    override var isFlipped: Bool { true }
+    override func draw(_ r: NSRect) { fill.setFill(); NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius).fill() }
+}
+
+if let i = CommandLine.arguments.firstIndex(of: "--screenshots"), i + 1 < CommandLine.arguments.count { // render README images from sample data
+    _ = NSApplication.shared
+    let dir = URL(fileURLWithPath: CommandLine.arguments[i + 1])
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let now = Date()
+    func win(_ p: Double, _ secs: TimeInterval) -> Window { Window(percent: p, resetsAt: now.addingTimeInterval(secs)) }
+    let claude = Usage(fiveHour: win(42, 8_000), weekly: win(68, 3 * 86_400), updated: now)
+    let codex = Usage(fiveHour: win(7, 16_000), weekly: win(31, 5 * 86_400), updated: now)
+    func save(_ v: NSView, _ name: String) {   // 2x render
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(v.bounds.width * 2), pixelsHigh: Int(v.bounds.height * 2), bitsPerSample: 8,
+                                   samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        rep.size = v.bounds.size
+        v.cacheDisplay(in: v.bounds, to: rep)
+        try! rep.representation(using: .png, properties: [:])!.write(to: dir.appendingPathComponent(name))
+    }
+    func seg(_ tag: String, _ u: Usage) -> BarSeg { BarSeg(tag: tag, percent: u.fiveHour?.percent, weekly: u.weekly?.percent, text: label(u, now: now), stale: false) }
+    let f = DateFormatter(); f.dateFormat = "HH:mm"
+    for dark in [true, false] {
+        let mode = dark ? "dark" : "light", look = NSAppearance(named: dark ? .darkAqua : .aqua)
+        // menu-bar strip
+        let img = barImage([seg("C", claude), seg("X", codex)])
+        let strip = Backdrop(NSRect(x: 0, y: 0, width: img.size.width + 28, height: 30), fill: NSColor(white: dark ? 0.13 : 0.88, alpha: 1), radius: 7)
+        let iv = NSImageView(image: img); iv.frame = NSRect(x: 14, y: 4, width: img.size.width, height: 22); strip.addSubview(iv)
+        strip.appearance = look; save(strip, "menubar-\(mode).png")
+        // dropdown
+        var rows: [NSView] = []
+        for (name, u) in [("Claude", claude), ("Codex", codex)] {
+            let five = MeterRow(label: "5h", base: color5h), week = MeterRow(label: "Week", base: colorWeek)
+            five.set(u.fiveHour, now: now); week.set(u.weekly, now: now)
+            rows += [TextRow(name, bold: true), five, week, TextRow("\(name == "Claude" ? "live" : "sessions") · updated \(f.string(from: now))")]
+            rows.append(Backdrop(NSRect(x: 0, y: 0, width: 292, height: 1), fill: NSColor(white: dark ? 1 : 0, alpha: 0.15)))
+        }
+        rows.append(TextRow("Refreshed 2s ago"))
+        let panel = Backdrop(NSRect(x: 0, y: 0, width: 320, height: rows.reduce(16) { $0 + max($1.frame.height, 1) + ($1 is Backdrop ? 8 : 0) }),
+                             fill: NSColor(white: dark ? 0.17 : 0.96, alpha: 1), radius: 12)
+        var y: CGFloat = 8
+        for v in rows {
+            if v is Backdrop { y += 4; v.frame.origin = NSPoint(x: 14, y: y); y += 5 } else { v.frame.origin = NSPoint(x: 0, y: y); y += v.frame.height }
+            panel.addSubview(v)
+        }
+        panel.appearance = look; save(panel, "dropdown-\(mode).png")
+    }
+    exit(0)
+}
 if CommandLine.arguments.contains("--print") { // debug: show what the app would display
     let h = FileManager.default.homeDirectoryForCurrentUser, now = Date()
     let c = (try? Data(contentsOf: h.appendingPathComponent(".claude/.usage.json"))).flatMap(parseClaude)
