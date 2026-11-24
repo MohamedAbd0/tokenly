@@ -295,7 +295,7 @@ func runCLI(_ name: String, _ args: [String], timeout: TimeInterval = 120) -> St
 final class Primer {
     let name: String, tool: String, args: [String]
     var lastAttempt = Date.distantPast, running = false, failure = ""
-    var onEvent: ((String) -> Void)?
+    var onEvent: ((String, Bool) -> Void)?   // (message, loud)
     init(name: String, tool: String, args: [String]) { self.name = name; self.tool = tool; self.args = args }
     var enabled: Bool {
         get { UserDefaults.standard.bool(forKey: "auto" + name) }
@@ -311,12 +311,12 @@ final class Primer {
             DispatchQueue.main.async {
                 self.running = false
                 if let e = err {
-                    if e != self.failure { self.onEvent?("\(self.name) auto-start failed: \(e)") }   // once per distinct failure
+                    if e != self.failure { self.onEvent?("\(self.name) auto-start failed: \(e)", true) }   // once per distinct failure
                     self.failure = e
                 } else {
                     self.failure = ""
                     UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "primed" + self.name)
-                    self.onEvent?("\(self.name): new 5h window started")
+                    self.onEvent?("\(self.name): new 5h window started", false)
                 }
                 done()
             }
@@ -341,24 +341,25 @@ func nextAlert(percent: Double, fired: Set<Int>) -> Int? { alertLevels.first { p
 /// Per-window watcher (tool + "5h"/"week"): threshold alerts once per window + one "window reset" when a window ends.
 final class Alerts {
     private var end: [String: Date] = [:], fired: [String: Set<Int>] = [:]
-    func update(_ name: String, _ label: String, _ w: Window?, now: Date, notify: (String) -> Void) {
+    func update(_ name: String, _ label: String, _ w: Window?, now: Date, notify: (String, Bool) -> Void) {
         let key = "\(name)|\(label)"
         guard let w = w, w.resetsAt > now else {   // no active window
-            if let e = end[key], e <= now { notify("\(name): \(label) window reset"); end[key] = nil; fired[key] = [] }
+            if let e = end[key], e <= now { notify("\(name): \(label) window reset", false); end[key] = nil; fired[key] = [] }
             return
         }
-        if let e = end[key], abs(e.timeIntervalSince(w.resetsAt)) > 120 { notify("\(name): \(label) window reset"); fired[key] = [] } // new window seen directly
+        if let e = end[key], abs(e.timeIntervalSince(w.resetsAt)) > 120 { notify("\(name): \(label) window reset", false); fired[key] = [] } // new window seen directly
         end[key] = w.resetsAt
         if let t = nextAlert(percent: w.percent, fired: fired[key] ?? []) {
             fired[key, default: []].formUnion(alertLevels.filter { $0 <= t })
-            notify("\(name): \(label) at \(Int(w.percent.rounded()))% — resets in \(remaining(w.resetsAt, now: now))")
+            notify("\(name): \(label) at \(Int(w.percent.rounded()))% — resets in \(remaining(w.resetsAt, now: now))", t >= 95)
         }
     }
 }
 
-func notify(_ title: String, _ body: String) {
+/// Banner always; sound only when `loud` (95% alerts and failures). Routine events stay silent so night-time auto-start never wakes you.
+func notify(_ title: String, _ body: String, loud: Bool = false) {
     guard Bundle.main.bundleIdentifier != nil else { return }   // needs the .app bundle
-    let c = UNMutableNotificationContent(); c.title = title; c.body = body; c.sound = .default
+    let c = UNMutableNotificationContent(); c.title = title; c.body = body; c.sound = loud ? .default : nil
     UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
 }
 
@@ -421,8 +422,8 @@ func selftest() {
     check(nextAlert(percent: 96, fired: [80]) == 95, "alert: 95 after 80")
     check(nextAlert(percent: 96, fired: [80, 95]) == nil, "alert: nothing left")
     func win(_ p: Double, ends: TimeInterval) -> Usage { Usage(fiveHour: Window(percent: p, resetsAt: now.addingTimeInterval(ends)), weekly: nil, updated: now) }
-    let al = Alerts(); var msgs: [String] = []
-    func step(_ u: Usage?, _ at: Date? = nil) { al.update("T", "5h", u?.fiveHour, now: at ?? now, notify: { msgs.append($0) }) }
+    let al = Alerts(); var msgs: [String] = [], loud: [Bool] = []
+    func step(_ u: Usage?, _ at: Date? = nil) { al.update("T", "5h", u?.fiveHour, now: at ?? now, notify: { msgs.append($0); loud.append($1) }) }
     step(win(50, ends: 3600)); check(msgs.isEmpty, "alerts: 50% silent")
     step(win(85, ends: 3600)); check(msgs.count == 1 && msgs[0].contains("85%"), "alerts: 85% fires once")
     step(win(86, ends: 3600)); check(msgs.count == 1, "alerts: no repeat at 86%")
@@ -431,12 +432,14 @@ func selftest() {
     step(nil, now.addingTimeInterval(3601)); check(msgs.count == 3 && msgs[2].contains("reset"), "alerts: window end -> reset once")
     step(nil, now.addingTimeInterval(3700)); check(msgs.count == 3, "alerts: reset not repeated")
     let later = now.addingTimeInterval(4000)
-    al.update("T", "5h", Window(percent: 85, resetsAt: later.addingTimeInterval(18000)), now: later, notify: { msgs.append($0) })
+    al.update("T", "5h", Window(percent: 85, resetsAt: later.addingTimeInterval(18000)), now: later, notify: { msgs.append($0); loud.append($1) })
     check(msgs.count == 4, "alerts: next window can alert again")
-    al.update("T", "week", Window(percent: 82, resetsAt: later.addingTimeInterval(400_000)), now: later, notify: { msgs.append($0) })
+    al.update("T", "week", Window(percent: 82, resetsAt: later.addingTimeInterval(400_000)), now: later, notify: { msgs.append($0); loud.append($1) })
     check(msgs.count == 5 && msgs[4].contains("week at 82%"), "alerts: weekly window alerts on its own, independent of 5h")
-    al.update("T", "week", Window(percent: 83, resetsAt: later.addingTimeInterval(400_000)), now: later, notify: { msgs.append($0) })
+    al.update("T", "week", Window(percent: 83, resetsAt: later.addingTimeInterval(400_000)), now: later, notify: { msgs.append($0); loud.append($1) })
     check(msgs.count == 5, "alerts: weekly no repeat")
+    // sound: only the 95% alert is loud; 80% and window reset are silent
+    check(loud == [false, true, false, false, false], "alerts: only 95% is loud (80% quiet, reset quiet, 85% of next window quiet, weekly 80% quiet)")
 
     print(failed ? "selftest FAILED" : "selftest ok")
     exit(failed ? 1 : 0)
@@ -469,7 +472,7 @@ final class App: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelega
             DispatchQueue.main.asyncAfter(deadline: .now() + 6) { NSApp.terminate(nil) }
             return
         }
-        primers.forEach { $0.onEvent = { notify("Tokenly", $0) } }
+        primers.forEach { $0.onEvent = { notify("Tokenly", $0, loud: $1) } }
         // Menu is built once; refresh() updates the views in place so it stays live while open.
         let menu = NSMenu()
         func addView(_ v: NSView) { let i = NSMenuItem(); i.view = v; menu.addItem(i) }
@@ -542,8 +545,8 @@ final class App: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelega
         let f = DateFormatter(); f.dateFormat = "HH:mm"
         for (name, u) in [("Claude", claude), ("Codex", codex)] {
             guard let p = panels[name] else { continue }
-            alerts.update(name, "5h", u?.fiveHour, now: now) { notify("Tokenly", $0) }   // threshold + reset notifications
-            alerts.update(name, "week", u?.weekly, now: now) { notify("Tokenly", $0) }
+            alerts.update(name, "5h", u?.fiveHour, now: now) { notify("Tokenly", $0, loud: $1) }   // threshold + reset notifications
+            alerts.update(name, "week", u?.weekly, now: now) { notify("Tokenly", $0, loud: $1) }
             p.five.set(u?.fiveHour, now: now)
             p.week.set(u?.weekly, now: now)
             var info = u.map { "\(name == "Claude" ? (isLive ? "live" : "CLI") : "sessions") · updated \(f.string(from: $0.updated))" } ?? "no data yet"
