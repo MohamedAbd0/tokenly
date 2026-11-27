@@ -38,7 +38,7 @@ func parseCodex(lines: [String], updated: Date) -> Usage? {
     return nil
 }
 
-/// Newest few session files by mtime (path dates lie for resumed sessions); read only the tail.
+/// Newest session files by mtime (path dates lie for resumed sessions); read only the tail.
 func loadCodex(root: URL) -> Usage? {
     let keys: [URLResourceKey] = [.contentModificationDateKey]
     guard let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys) else { return nil }
@@ -46,7 +46,7 @@ func loadCodex(root: URL) -> Usage? {
     for case let u as URL in en where u.pathExtension == "jsonl" {
         files.append((u, (try? u.resourceValues(forKeys: Set(keys)))?.contentModificationDate ?? .distantPast))
     }
-    for (url, mtime) in files.sorted(by: { $0.1 > $1.1 }).prefix(5) {
+    for (url, mtime) in files.sorted(by: { $0.1 > $1.1 }).prefix(30) { // limit-reached sessions carry no windows, so look past a run of them
         guard let h = try? FileHandle(forReadingFrom: url) else { continue }
         defer { try? h.close() }
         let size = (try? h.seekToEnd()) ?? 0
@@ -207,6 +207,93 @@ func parseClaudeAPI(_ data: Data, now: Date) -> Usage? {
     return f == nil && wk == nil ? nil : Usage(fiveHour: f, weekly: wk, updated: now)
 }
 
+/// `codex app-server` account/rateLimits/read reply. An unused 5h window slides (reset = now + 5h): it hasn't started, so report it as over.
+func parseCodexLive(_ data: Data, now: Date) -> Usage? {
+    guard let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let rl = (o["result"] as? [String: Any])?["rateLimits"] as? [String: Any] else { return nil }
+    func w(_ k: String, sliding: Bool) -> Window? {
+        guard let d = rl[k] as? [String: Any], let p = d["usedPercent"] as? Double, let r = d["resetsAt"] as? Double else { return nil }
+        let mins = d["windowDurationMins"] as? Double ?? 0
+        let unstarted = sliding && p == 0 && mins > 0 && r - now.timeIntervalSince1970 >= mins * 60 - 60
+        return Window(percent: p, resetsAt: unstarted ? now.addingTimeInterval(-1) : Date(timeIntervalSince1970: r))
+    }
+    let f = w("primary", sliding: true), wk = w("secondary", sliding: false)
+    return f == nil && wk == nil ? nil : Usage(fiveHour: f, weekly: wk, updated: now)
+}
+
+/// Asks the official Codex CLI for the account's current limits (same data as /status). Uses no quota; Codex handles its own login.
+func readCodexLive(timeout: TimeInterval = 20) -> (Usage?, String) {
+    guard let bin = findBinary("codex") else { return (nil, "codex not found") }
+    let p = cliProcess(bin, ["app-server"])
+    let input = Pipe(), output = Pipe()
+    p.standardInput = input; p.standardOutput = output; p.standardError = FileHandle.nullDevice
+    let done = DispatchSemaphore(value: 0), lock = NSLock()
+    var buffer = Data(), reply: Data?
+    output.fileHandleForReading.readabilityHandler = { h in
+        let chunk = h.availableData
+        lock.lock(); defer { lock.unlock() }
+        if chunk.isEmpty { h.readabilityHandler = nil; done.signal(); return }
+        buffer.append(chunk)
+        while let nl = buffer.firstIndex(of: 10) {
+            let line = Data(buffer[buffer.startIndex..<nl]); buffer.removeSubrange(buffer.startIndex...nl)
+            if let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any], o["id"] as? Int == 1 { reply = line; done.signal() }
+        }
+    }
+    do { try p.run() } catch { return (nil, "could not start codex") }
+    let requests = #"""
+    {"method":"initialize","id":0,"params":{"clientInfo":{"name":"tokenly","title":"Tokenly","version":"1.0"}}}
+    {"method":"initialized","params":{}}
+    {"method":"account/rateLimits/read","id":1}
+
+    """#
+    try? input.fileHandleForWriting.write(contentsOf: Data(requests.utf8))
+    let timedOut = done.wait(timeout: .now() + timeout) == .timedOut
+    output.fileHandleForReading.readabilityHandler = nil
+    p.terminate()
+    lock.lock(); defer { lock.unlock() }
+    guard let r = reply else { return (nil, timedOut ? "timeout" : "no reply") }
+    let u = parseCodexLive(r, now: Date())
+    return (u, u == nil ? "unexpected reply" : "")
+}
+
+let agyGroups = [("gemini", "agy · Gemini")]   // (bucket id prefix, title) shown; the CLI also reports "3p" (Claude/GPT), not wanted
+
+/// `agy -p /usage --output-format json` reply. Nil for anything else, including a model answering the text as a prompt.
+func parseAgy(_ data: Data, now: Date) -> [String: Usage]? {
+    guard let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any], o["num_turns"] as? Int == 0,
+          let cmd = o["command"] as? [String: Any], cmd["name"] as? String == "usage",
+          let groups = (cmd["data"] as? [String: Any])?["groups"] as? [[String: Any]] else { return nil }
+    var result: [String: Usage] = [:]
+    for b in groups.flatMap({ $0["buckets"] as? [[String: Any]] ?? [] }) {
+        guard let id = b["id"] as? String, let dash = id.lastIndex(of: "-"), let kind = b["window"] as? String,
+              let left = b["remaining_fraction"] as? Double,
+              let r = b["reset_time"] as? String, let reset = isoDate(r) else { continue }
+        let key = String(id[..<dash]), length: TimeInterval = kind == "5h" ? 5 * 3600 : 7 * 86400
+        let unstarted = left >= 1 && reset.timeIntervalSince(now) >= length - 60   // unused windows slide, like Codex
+        let w = Window(percent: (1 - left) * 100, resetsAt: unstarted ? now.addingTimeInterval(-1) : reset)
+        let old = result[key]
+        result[key] = Usage(fiveHour: kind == "5h" ? w : old?.fiveHour, weekly: kind == "5h" ? old?.weekly : w, updated: now)
+    }
+    return result.isEmpty ? nil : result
+}
+
+/// The official CLI's own /usage command: no tokens used. `--log-file /dev/null` so polling doesn't pile up log files.
+/// `spentQuota` = the CLI treated "/usage" as a prompt, so we must not ask again.
+func readAgyLive(timeout: TimeInterval = 60) -> (usage: [String: Usage]?, note: String, spentQuota: Bool) {
+    guard let bin = findBinary("agy") else { return (nil, "agy not found", false) }
+    let p = cliProcess(bin, ["-p", "/usage", "--output-format", "json", "--print-timeout", "40s", "--log-file", "/dev/null"])
+    let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
+    let done = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in done.signal() }
+    do { try p.run() } catch { return (nil, "could not start agy", false) }
+    if done.wait(timeout: .now() + timeout) == .timedOut { p.terminate(); return (nil, "timeout", false) }
+    let data = out.fileHandleForReading.readDataToEndOfFile()   // ponytail: reply is ~2 KB, far below the pipe buffer
+    if let u = parseAgy(data, now: Date()) { return (u, "", false) }
+    let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    if (o?["num_turns"] as? Int ?? 0) > 0 { return (nil, "update agy (no /usage)", true) }
+    return (nil, p.terminationStatus == 0 ? "unexpected reply" : "exit \(p.terminationStatus)", false)
+}
+
 /// Claude Code's own login token. Read by this app at runtime (macOS asks you to allow it); never logged or stored.
 func readKeychainToken() -> (token: String, expires: Date)? {
     let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
@@ -220,42 +307,64 @@ func readKeychainToken() -> (token: String, expires: Date)? {
     return (t, (c["expiresAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) } ?? .distantFuture)
 }
 
-final class ClaudeLive {
+/// Throttled (default 60s) so the 5s UI refresh never hammers the source; `fetch` runs off the main thread.
+class LiveSource<Value> {
     private let q = DispatchQueue(label: "tokenly.live")
-    private var token: String?, expires = Date.distantPast   // q only
     private var busy = false, last = Date.distantPast        // main only
-    private(set) var latest: Usage?, note = ""                // main only
+    private(set) var latest: Value?, note = ""                // main only
     func expedite() { last = .distantPast }                   // poll again on the next tick
 
-    /// Throttled (default 60s) so the 5s UI refresh never hammers the API; keychain/network run off the main thread.
+    func fetch() -> (Value?, String) { (nil, "") }
     func poll(every: TimeInterval = 60, done: @escaping () -> Void) {
         guard !busy, Date().timeIntervalSince(last) >= every else { return }
         busy = true; last = Date()
         q.async {
-            var note = "", usage: Usage?
-            if self.token == nil || self.expires < Date() {
-                if let k = readKeychainToken() { (self.token, self.expires) = (k.token, k.expires) } else { self.token = nil; note = "no keychain access" }
-            }
-            if let t = self.token, self.expires > Date() {
-                var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 10)
-                req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
-                req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-                req.setValue("Tokenly/1.0", forHTTPHeaderField: "User-Agent")
-                let sem = DispatchSemaphore(value: 0)
-                URLSession.shared.dataTask(with: req) { data, resp, err in
-                    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                    if code == 200, let d = data { usage = parseClaudeAPI(d, now: Date()); if usage == nil { note = "unexpected reply" } }
-                    else { note = err != nil ? "offline" : "HTTP \(code)"; if code == 401 || code == 403 { self.token = nil } }
-                    sem.signal()
-                }.resume()
-                sem.wait()
-            } else if note.isEmpty { note = "token expired" }
+            let (usage, note) = self.fetch()
             DispatchQueue.main.async {
                 self.busy = false; self.note = note
                 if let u = usage { self.latest = u }
                 done()
             }
         }
+    }
+}
+
+final class AgyLive: LiveSource<[String: Usage]> {
+    private var stopped = false   // fetch queue only
+    override func fetch() -> ([String: Usage]?, String) {
+        if stopped { return (nil, "update agy (no /usage)") }
+        let r = readAgyLive()
+        stopped = r.spentQuota
+        return (r.usage, r.note)
+    }
+}
+
+final class CodexLive: LiveSource<Usage> {
+    override func fetch() -> (Usage?, String) { readCodexLive() }
+}
+
+final class ClaudeLive: LiveSource<Usage> {
+    private var token: String?, expires = Date.distantPast   // fetch queue only
+    override func fetch() -> (Usage?, String) {
+        var note = "", usage: Usage?
+        if self.token == nil || self.expires < Date() {
+            if let k = readKeychainToken() { (self.token, self.expires) = (k.token, k.expires) } else { self.token = nil; note = "no keychain access" }
+        }
+        if let t = self.token, self.expires > Date() {
+            var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 10)
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+            req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+            req.setValue("Tokenly/1.0", forHTTPHeaderField: "User-Agent")
+            let sem = DispatchSemaphore(value: 0)
+            URLSession.shared.dataTask(with: req) { data, resp, err in
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code == 200, let d = data { usage = parseClaudeAPI(d, now: Date()); if usage == nil { note = "unexpected reply" } }
+                else { note = err != nil ? "offline" : "HTTP \(code)"; if code == 401 || code == 403 { self.token = nil } }
+                sem.signal()
+            }.resume()
+            sem.wait()
+        } else if note.isEmpty { note = "token expired" }
+        return (usage, note)
     }
 }
 
@@ -266,6 +375,7 @@ final class ClaudeLive {
 func shouldPrime(enabled: Bool, usage: Usage?, fresh: Bool, now: Date, lastSuccess: Date, lastAttempt: Date, running: Bool) -> Bool {
     guard enabled, !running, fresh, let u = usage else { return false }
     if let w = u.fiveHour, w.resetsAt >= now { return false }
+    if let w = u.weekly, w.percent >= 100, w.resetsAt >= now { return false } // the message would only fail
     return now.timeIntervalSince(lastSuccess) >= 5 * 3600 && now.timeIntervalSince(lastAttempt) >= 600
 }
 
@@ -276,14 +386,20 @@ func findBinary(_ name: String) -> URL? {
     return dirs.map { URL(fileURLWithPath: $0).appendingPathComponent(name) }.first { fm.isExecutableFile(atPath: $0.path) }
 }
 
-/// Runs the CLI once (launchd gives apps a bare PATH, so node's dir is added). Returns nil on success, else a short reason.
-func runCLI(_ name: String, _ args: [String], timeout: TimeInterval = 120) -> String? {
-    guard let bin = findBinary(name) else { return "\(name) not found" }
+/// launchd gives apps a bare PATH, so node's dir is added. Runs from the temp dir (no project context).
+func cliProcess(_ bin: URL, _ args: [String]) -> Process {
     let p = Process(); p.executableURL = bin; p.arguments = args
-    p.currentDirectoryURL = URL(fileURLWithPath: NSTemporaryDirectory())   // no project context
+    p.currentDirectoryURL = URL(fileURLWithPath: NSTemporaryDirectory())
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = "\(bin.deletingLastPathComponent().path):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
     p.environment = env
+    return p
+}
+
+/// Runs the CLI once. Returns nil on success, else a short reason.
+func runCLI(_ name: String, _ args: [String], timeout: TimeInterval = 120) -> String? {
+    guard let bin = findBinary(name) else { return "\(name) not found" }
+    let p = cliProcess(bin, args)
     p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
     let done = DispatchSemaphore(value: 0)
     p.terminationHandler = { _ in done.signal() }
@@ -415,6 +531,31 @@ func selftest() {
     check(!sp(idle, att: now.addingTimeInterval(-300)), "no prime: attempt 5 min ago")
     check(sp(idle, att: now.addingTimeInterval(-601)), "prime: attempt 10+ min ago")
 
+    let rpc = parseCodexLive(#"{"id":1,"result":{"rateLimits":{"primary":{"usedPercent":100,"windowDurationMins":300,"resetsAt":1795015000},"secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":1795500000}}}}"#.data(using: .utf8)!, now: now)
+    check(rpc?.fiveHour?.percent == 100 && rpc?.weekly?.percent == 20, "codex live percents")
+    check(rpc?.fiveHour?.resetsAt.timeIntervalSince1970 == 1795015000, "codex live reset")
+    let unstarted = parseCodexLive(#"{"id":1,"result":{"rateLimits":{"primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":1795018000},"secondary":null}}}"#.data(using: .utf8)!, now: now)
+    check(unstarted?.fiveHour.map { $0.resetsAt < now } == true, "codex live: unused sliding window counts as over")
+    check(parseCodexLive(#"{"id":1,"error":{"message":"no"}}"#.data(using: .utf8)!, now: now) == nil, "codex live error -> nil")
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("tokenly-selftest-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    for i in 0...6 {
+        let u = tmp.appendingPathComponent("\(i).jsonl")
+        try? (i == 0 ? ev : #"{"payload":{"rate_limits":{"limit_id":"premium","primary":null,"secondary":null}}}"#).write(to: u, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(Double(i) * 60)], ofItemAtPath: u.path)
+    }
+    check(loadCodex(root: tmp)?.fiveHour?.percent == 6.0, "codex: limit-reached sessions don't hide the last real numbers")
+    try? FileManager.default.removeItem(at: tmp)
+    let weekOut = Usage(fiveHour: nil, weekly: Window(percent: 100, resetsAt: now.addingTimeInterval(9999)), updated: now)
+    check(!sp(weekOut), "no prime: weekly limit used up")
+
+    let agyReply = #"{"num_turns":0,"command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.66,"reset_time":"2026-11-25T10:00:00Z"},{"id":"gemini-5h","window":"5h","remaining_fraction":0,"reset_time":"2026-11-18T12:00:00Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-5h","window":"5h","remaining_fraction":1,"reset_time":"%@"}]}]}}}"#
+    let sliding = ISO8601DateFormatter().string(from: now.addingTimeInterval(18000))
+    let ag = parseAgy(Data(agyReply.replacingOccurrences(of: "%@", with: sliding).utf8), now: now)
+    check(abs((ag?["gemini"]?.weekly?.percent ?? 0) - 34) < 0.01 && ag?["gemini"]?.fiveHour?.percent == 100, "agy: remaining -> used")
+    check(ag?["3p"]?.fiveHour.map { $0.percent == 0 && $0.resetsAt < now } == true, "agy: unused sliding window counts as over")
+    check(parseAgy(Data(#"{"num_turns":1,"response":"Hello"}"#.utf8), now: now) == nil, "agy: a model reply is not usage")
+
     // alerts
     check(nextAlert(percent: 70, fired: []) == nil, "alert: below 80")
     check(nextAlert(percent: 85, fired: []) == 80, "alert: 85 -> 80")
@@ -452,7 +593,7 @@ final class App: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelega
     let home = FileManager.default.homeDirectoryForCurrentUser
     let staleAfter: TimeInterval = 3600, pollEvery: TimeInterval = 5
     var lastRefresh = Date()
-    let live = ClaudeLive()
+    let live = ClaudeLive(), codexLive = CodexLive(), agyLive = AgyLive()
     let alerts = Alerts()
     // Minimal messages: no tools, no session saved, cheapest model. Run from the temp dir (no project context).
     lazy var primers = [
@@ -476,7 +617,8 @@ final class App: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelega
         // Menu is built once; refresh() updates the views in place so it stays live while open.
         let menu = NSMenu()
         func addView(_ v: NSView) { let i = NSMenuItem(); i.view = v; menu.addItem(i) }
-        for name in ["Claude", "Codex"] {
+        let agyTitles = findBinary("agy") == nil ? [] : agyGroups.map { $0.1 }   // dropdown only, hidden without agy
+        for name in ["Claude", "Codex"] + agyTitles {
             let p = (five: MeterRow(label: "5h", base: color5h), week: MeterRow(label: "Week", base: colorWeek), info: TextRow(""))
             addView(TextRow(name, bold: true)); addView(p.five); addView(p.week); addView(p.info)
             panels[name] = p
@@ -527,7 +669,13 @@ final class App: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelega
         let fromFile = (try? Data(contentsOf: home.appendingPathComponent(".claude/.usage.json"))).flatMap(parseClaude)
         let claude = [live.latest, fromFile].compactMap { $0 }.max { $0.updated < $1.updated } // freshest source wins
         let isLive = claude != nil && claude?.updated == live.latest?.updated
-        let codex = loadCodex(root: home.appendingPathComponent(".codex/sessions"))
+        codexLive.poll { [weak self] in self?.lastRefresh = .distantPast }
+        // live wins while current (it sees usage from every device); session files are the offline fallback
+        let liveX = codexLive.latest
+        let fromSessions = loadCodex(root: home.appendingPathComponent(".codex/sessions"))
+        let codex = liveX.map { now.timeIntervalSince($0.updated) < 180 } == true ? liveX
+            : [liveX, fromSessions].compactMap { $0 }.max { $0.updated < $1.updated }
+        let isCodexLive = codex != nil && codex?.updated == liveX?.updated
 
         func seg(_ tag: String, _ u: Usage?) -> BarSeg {
             let stale = u.map { now.timeIntervalSince($0.updated) > staleAfter } ?? true
@@ -538,19 +686,28 @@ final class App: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelega
         primers[0].maybe(usage: claude, fresh: isLive && now.timeIntervalSince(claude!.updated) < 180, now: now) { [weak self] in
             self?.live.expedite(); soon()
         }
-        primers[1].maybe(usage: codex, fresh: true, now: now, done: soon)
+        primers[1].maybe(usage: codex, fresh: isCodexLive && now.timeIntervalSince(codex!.updated) < 180, now: now) { [weak self] in
+            self?.codexLive.expedite(); soon()
+        }
         item.button?.title = ""
         item.button?.image = barImage([seg("C", claude), seg("X", codex)])
 
         let f = DateFormatter(); f.dateFormat = "HH:mm"
-        for (name, u) in [("Claude", claude), ("Codex", codex)] {
+        // after a failure, back off: a signed-out agy shouldn't be launched every minute
+        if panels[agyGroups[0].1] != nil { agyLive.poll(every: agyLive.note.isEmpty ? 60 : 600) { [weak self] in self?.lastRefresh = .distantPast } }
+        var shown: [(name: String, u: Usage?, source: String, onLive: Bool, note: String)] = [
+            ("Claude", claude, isLive ? "live" : "CLI", isLive, live.note),
+            ("Codex", codex, isCodexLive ? "live" : "sessions", isCodexLive, codexLive.note),
+        ]
+        shown += agyGroups.map { ($0.1, agyLive.latest?[$0.0], "live", agyLive.note.isEmpty, agyLive.note) }
+        for (name, u, source, onLive, note) in shown {
             guard let p = panels[name] else { continue }
             alerts.update(name, "5h", u?.fiveHour, now: now) { notify("Tokenly", $0, loud: $1) }   // threshold + reset notifications
             alerts.update(name, "week", u?.weekly, now: now) { notify("Tokenly", $0, loud: $1) }
             p.five.set(u?.fiveHour, now: now)
             p.week.set(u?.weekly, now: now)
-            var info = u.map { "\(name == "Claude" ? (isLive ? "live" : "CLI") : "sessions") · updated \(f.string(from: $0.updated))" } ?? "no data yet"
-            if name == "Claude" && !isLive && !live.note.isEmpty { info += " · live: \(live.note)" }
+            var info = u.map { "\(source) · updated \(f.string(from: $0.updated))" } ?? "no data yet"
+            if !onLive && !note.isEmpty { info += " · live: \(note)" }
             if let pr = primers.first(where: { $0.name == name }), pr.enabled { info += " · " + pr.status() }
             p.info.text = info
         }
@@ -593,10 +750,11 @@ if let i = CommandLine.arguments.firstIndex(of: "--screenshots"), i + 1 < Comman
         strip.appearance = look; save(strip, "menubar-\(mode).png")
         // dropdown
         var rows: [NSView] = []
-        for (name, u) in [("Claude", claude), ("Codex", codex)] {
+        let gemini = Usage(fiveHour: win(55, 9_000), weekly: win(34, 6 * 86_400), updated: now)
+        for (name, u) in [("Claude", claude), ("Codex", codex), (agyGroups[0].1, gemini)] {
             let five = MeterRow(label: "5h", base: color5h), week = MeterRow(label: "Week", base: colorWeek)
             five.set(u.fiveHour, now: now); week.set(u.weekly, now: now)
-            rows += [TextRow(name, bold: true), five, week, TextRow("\(name == "Claude" ? "live" : "sessions") · updated \(f.string(from: now))")]
+            rows += [TextRow(name, bold: true), five, week, TextRow("live · updated \(f.string(from: now))")]
             rows.append(Backdrop(NSRect(x: 0, y: 0, width: 292, height: 1), fill: NSColor(white: dark ? 1 : 0, alpha: 0.15)))
         }
         rows.append(TextRow("Refreshed 2s ago"))
@@ -614,9 +772,13 @@ if let i = CommandLine.arguments.firstIndex(of: "--screenshots"), i + 1 < Comman
 if CommandLine.arguments.contains("--print") { // debug: show what the app would display
     let h = FileManager.default.homeDirectoryForCurrentUser, now = Date()
     let c = (try? Data(contentsOf: h.appendingPathComponent(".claude/.usage.json"))).flatMap(parseClaude)
-    let x = loadCodex(root: h.appendingPathComponent(".codex/sessions"))
+    let (liveX, note) = readCodexLive()
+    let x = liveX ?? loadCodex(root: h.appendingPathComponent(".codex/sessions"))
+    print("Codex source: \(liveX != nil ? "live" : "sessions (live: \(note))")")
     print("C \(label(c, now: now)) · X \(label(x, now: now))")
-    for (n, u) in [("Claude", c), ("Codex", x)] { print(n, row("5h", u?.fiveHour, now: now), row("Week", u?.weekly, now: now)) }
+    let agy = readAgyLive()
+    if agy.usage == nil { print("agy: \(agy.note)") }
+    for (n, u) in [("Claude", c), ("Codex", x)] + agyGroups.compactMap({ g in agy.usage?[g.0].map { (g.1, Optional($0)) } }) { print(n, row("5h", u?.fiveHour, now: Date()), row("Week", u?.weekly, now: Date())) }
     exit(0)
 }
 let app = NSApplication.shared

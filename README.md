@@ -2,7 +2,7 @@
 
 # Tokenly
 
-A tiny macOS menu-bar app that shows your **Claude Code** and **Codex** subscription limits as progress bars.
+A tiny macOS menu-bar app that shows your **Claude Code**, **Codex** and **Antigravity (`agy`)** subscription limits as progress bars.
 
 <p align="center">
   <picture>
@@ -18,7 +18,8 @@ A tiny macOS menu-bar app that shows your **Claude Code** and **Codex** subscrip
 
 Green is the 5-hour window, purple the weekly one (red from 90 %).
 
-- Two bars per tool in the menu bar (5h + week). The number is the 5h percentage.
+- Two bars each for Claude and Codex in the menu bar (5h + week). The number is the 5h percentage.
+- Antigravity's Gemini quota is in the dropdown only, if `agy` is installed.
 - Click it for a detail list: percentage and time until reset for each window.
 - Refreshes every 5 seconds. Data older than an hour is dimmed.
 - Notifications at **80 %** and **95 %** for the 5h and the weekly window, and when a window resets.
@@ -28,7 +29,7 @@ Green is the 5-hour window, purple the weekly one (red from 90 %).
 
 ## Install
 
-Requirements: macOS with the Xcode command line tools (`xcode-select --install`), and Claude Code and/or Codex already signed in.
+Requirements: macOS with the Xcode command line tools (`xcode-select --install`), and Claude Code, Codex and/or Antigravity CLI already signed in.
 
 ```bash
 git clone https://github.com/MohamedAbd0/tokenly.git
@@ -49,13 +50,16 @@ rm -rf ~/Applications/Tokenly.app ~/Library/LaunchAgents/local.tokenly.plist
 
 | Tool | Source |
 |------|--------|
-| **Codex** | The newest `rate_limits` event in `~/.codex/sessions/**/*.jsonl`. Local only. Updates when you use Codex. |
+| **Codex (live)** | Asks the official CLI (`codex app-server`, `account/rateLimits/read`) about once a minute. Same numbers as `/status`, including usage from other devices; uses no quota. |
+| **Codex (fallback)** | If the CLI can't answer, the newest `rate_limits` event in `~/.codex/sessions/**/*.jsonl`. |
 | **Claude (live)** | Tokenly reads Claude Code's own login from the macOS Keychain (`Claude Code-credentials`) **at runtime** and asks `api.anthropic.com/api/oauth/usage` about once a minute. This works from the CLI, the VS Code extension and the desktop app. macOS will ask you to allow Keychain access; choose *Always Allow*. |
 | **Claude (CLI fallback)** | If the live source is unavailable, Tokenly reads `~/.claude/.usage.json`, written by Claude Code's status line (CLI sessions only). To enable it, add this right after `input=$(cat)` in your `~/.claude/statusline.sh` (needs `jq`): |
 
 ```bash
 printf '%s' "$input" | jq -ce 'select(.rate_limits != null) | {ts: (now|floor), rate_limits: .rate_limits}' > ~/.claude/.usage.json.tmp 2>/dev/null && [ -s ~/.claude/.usage.json.tmp ] && mv ~/.claude/.usage.json.tmp ~/.claude/.usage.json
 ```
+
+**Antigravity:** Tokenly runs `agy -p /usage` about once a minute (no tokens used; needs an `agy` version whose print mode supports `/usage`). There is no auto-start for it.
 
 The dropdown shows which source is in use (`live`, `CLI` or `sessions`) and the reason if the live source fails.
 
@@ -66,11 +70,11 @@ Turn on **Auto-start Claude window** / **Auto-start Codex window** from the menu
 - `claude -p ok --model haiku --no-session-persistence --tools "" …`
 - `codex exec … ok`
 
-It never sends again within 5 hours of a successful start, and retries a failure no sooner than 10 minutes later. Each message uses a small slice of your quota (a Codex message is roughly 12k tokens because of its system prompt). Codex sessions are written to `~/.codex/sessions` so Tokenly can see the new window.
+It only trusts live data, skips while the weekly limit is used up, never sends again within 5 hours of a successful start, and retries a failure no sooner than 10 minutes later. Each message uses a small slice of your quota (a Codex message is roughly 12k tokens because of its system prompt). Codex sessions are written to `~/.codex/sessions` so Tokenly can see the new window.
 
 ## Privacy and safety
 
-- No telemetry, no accounts. The only network call Tokenly makes itself is the usage request to `api.anthropic.com`, with your own token. The token is read from the Keychain when needed, kept in memory, and never logged or written to disk.
+- No telemetry, no accounts. The only network call Tokenly makes itself is the usage request to `api.anthropic.com`, with your own token (Codex and Antigravity limits are fetched by their own CLIs with their own logins). The token is read from the Keychain when needed, kept in memory, and never logged or written to disk.
 - Tokenly doesn't modify your files. The one optional change (the status-line snippet above) is yours to make.
 - Notifications are silent banners except the 95 % alert and auto-start failures.
 
